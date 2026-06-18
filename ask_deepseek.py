@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 import argparse
-import os
 import sys
+import os
 from pathlib import Path
+
+# PyInstaller subprocess hook
+if len(sys.argv) > 1 and sys.argv[1].endswith('.py'):
+    import runpy
+    sys.argv[0] = sys.argv[1]
+    del sys.argv[1]
+    runpy.run_path(sys.argv[0], run_name="__main__")
+    sys.exit(0)
 
 from dsk.api import DeepSeekAPI, AuthenticationError, APIError
 import auth_vault

@@ -2,7 +2,6 @@ from curl_cffi import requests
 from typing import Optional, Dict, Any, Generator, Literal
 import json
 from .pow import DeepSeekPOW
-import pkg_resources
 import sys
 from pathlib import Path
 import subprocess
@@ -45,20 +44,16 @@ class DeepSeekAPI:
             raise AuthenticationError("Invalid auth token provided")
 
         try:
-            curl_cffi_version = pkg_resources.get_distribution('curl-cffi').version
-            if curl_cffi_version != '0.8.1b9':
-                print("\033[93mWarning: DeepSeek API requires curl-cffi version 0.8.1b9", file=sys.stderr)
-                print("Please install the correct version using: pip install curl-cffi==0.8.1b9\033[0m", file=sys.stderr)
-        except pkg_resources.DistributionNotFound:
-            print("\033[93mWarning: curl-cffi not found. Please install version 0.8.1b9:", file=sys.stderr)
-            print("pip install curl-cffi==0.8.1b9\033[0m", file=sys.stderr)
+            self.impersonate = "chrome120"
+        except Exception:
+            self.impersonate = "chrome120"
 
         self.auth_token = auth_token
         self.pow_solver = DeepSeekPOW()
 
-        # Load cookies from JSON file
-        cookies_path = Path(__file__).parent / 'cookies.json'
+        self.cookies = {}
         try:
+            cookies_path = Path.home() / '.canvas_sync_vault' / 'cookies.json'
             with open(cookies_path, 'r') as f:
                 cookie_data = json.load(f)
                 self.cookies = cookie_data.get('cookies', {})
@@ -99,7 +94,7 @@ class DeepSeekAPI:
             time.sleep(2)
 
             # Reload cookies
-            cookies_path = Path(__file__).parent / 'cookies.json'
+            cookies_path = Path.home() / '.canvas_sync_vault' / 'cookies.json'
             with open(cookies_path, 'r') as f:
                 cookie_data = json.load(f)
                 self.cookies = cookie_data.get('cookies', {})
@@ -232,10 +227,16 @@ class DeepSeekAPI:
                 headers=headers,
                 json=json_data,
                 cookies=self.cookies,  # Add cookies
-                impersonate='chrome120',
+                impersonate=self.impersonate,
                 stream=True,
                 timeout=None
             )
+
+            if 'text/html' in response.headers.get('content-type', ''):
+                print("\033[93mWarning: Cloudflare protection detected during chat. Bypassing...\033[0m", file=sys.stderr)
+                self._refresh_cookies()
+                yield from self.chat_completion(chat_session_id, prompt, parent_message_id, thinking_enabled, search_enabled)
+                return
 
             if response.status_code != 200:
                 error_text = next(response.iter_lines(), b'').decode('utf-8', 'ignore')
@@ -266,20 +267,44 @@ class DeepSeekAPI:
 
         try:
             if chunk.startswith(b'data: '):
-                data = json.loads(chunk[6:])
+                chunk_str = chunk[6:].decode('utf-8', 'ignore').strip()
+                if not chunk_str or chunk_str == '{}':
+                    return None
+                data = json.loads(chunk_str)
 
+                # Old format
                 if 'choices' in data and data['choices']:
                     choice = data['choices'][0]
                     if 'delta' in choice:
                         delta = choice['delta']
-
                         return {
                             'content': delta.get('content', ''),
                             'type': delta.get('type', ''),
                             'finish_reason': choice.get('finish_reason')
                         }
+                
+                # New format
+                if 'v' in data:
+                    p = data.get('p')
+                    if p == 'response/thinking_content':
+                        self._current_type = 'thinking'
+                    elif p == 'response/content':
+                        self._current_type = 'text'
+                    elif p == 'response/status' and data['v'] == 'FINISHED':
+                        return {'content': '', 'type': 'text', 'finish_reason': 'stop'}
+                    
+                    if not hasattr(self, '_current_type'):
+                        self._current_type = 'thinking'
+                        
+                    if isinstance(data['v'], str):
+                        return {
+                            'content': data['v'],
+                            'type': getattr(self, '_current_type', 'text'),
+                            'finish_reason': None
+                        }
+                        
         except json.JSONDecodeError:
-            raise APIError("Invalid JSON in response chunk")
+            pass # ignore invalid json
         except Exception as e:
             raise APIError(f"Error parsing chunk: {str(e)}")
 

@@ -5,6 +5,7 @@ import sys
 import time
 import requests
 import json
+from pathlib import Path
 
 def validate_cookies(cookies_data):
     """Validate that cf_clearance cookie is present and not empty"""
@@ -72,7 +73,7 @@ if __name__ == "__main__":
         # Increase initial wait time to ensure server is fully started
         time.sleep(10)
         server_url = "http://localhost:8000/cookies?url=https://chat.deepseek.com"
-        cookie_file = "dsk/cookies.json"
+        cookie_file = str(Path.home() / '.canvas_sync_vault' / 'cookies.json')
 
         # Increase max retries for more reliability
         success = get_and_save_cookies(server_url, cookie_file, max_retries=5)
