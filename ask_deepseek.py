@@ -2,6 +2,7 @@
 import argparse
 import sys
 import os
+import time
 from pathlib import Path
 
 # PyInstaller subprocess hook
@@ -22,6 +23,7 @@ def main():
     parser.add_argument("--save-token", help="Securely save the DeepSeek API token to local hardware vault and exit.")
     parser.add_argument("--prompt", required=False, help="The prompt to send to DeepSeek.")
     parser.add_argument("--context", action="append", default=[], help="Path to a file (e.g. assignment JSON) to include in the context. Can be used multiple times.")
+    parser.add_argument("--upload", action="append", default=[], help="Path to a binary file (e.g. PDF) to natively upload to DeepSeek. Can be used multiple times.")
     parser.add_argument("--chat-id", help="Optional Chat ID to continue an existing conversation.")
     args = parser.parse_args()
 
@@ -78,6 +80,22 @@ def main():
 
     try:
         api = DeepSeekAPI(token)
+        
+        ref_file_ids = []
+        if args.upload:
+            print("Uploading files to DeepSeek...")
+            for up_path in args.upload:
+                path = Path(up_path).expanduser().resolve()
+                if path.exists():
+                    print(f"  Uploading {path.name}...")
+                    try:
+                        file_id = api.upload_file(str(path))
+                        ref_file_ids.append(file_id)
+                    except Exception as e:
+                        print(f"  Warning: Failed to upload {path.name}: {e}", file=sys.stderr)
+                else:
+                    print(f"Warning: Upload file {path} does not exist.", file=sys.stderr)
+
         chat_id = args.chat_id
         if not chat_id:
             chat_id = api.create_chat_session()
@@ -86,7 +104,7 @@ def main():
             print(f"Continuing DeepSeek chat session: {chat_id}")
 
         print("\nDeepSeek Response:\n" + "-"*40)
-        for chunk in api.chat_completion(chat_id, full_prompt):
+        for chunk in api.chat_completion(chat_id, full_prompt, ref_file_ids=ref_file_ids):
             if chunk['type'] == 'text':
                 print(chunk['content'], end='', flush=True)
         print("\n" + "-"*40)

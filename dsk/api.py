@@ -1,6 +1,7 @@
-from curl_cffi import requests
-from typing import Optional, Dict, Any, Generator, Literal
+from curl_cffi import requests, CurlMime
+from typing import Optional, Dict, Any, Generator, Literal, List
 import json
+import mimetypes
 from .pow import DeepSeekPOW
 import sys
 from pathlib import Path
@@ -153,6 +154,79 @@ class DeepSeekAPI:
 
         raise APIError("Failed to bypass Cloudflare protection after multiple attempts")
 
+    def _make_request_upload_file(self, endpoint: str, file_path: str) -> Any:
+        url = f"{self.BASE_URL}{endpoint}"
+        retry_count = 0
+        max_retries = 2
+
+        while retry_count < max_retries:
+            try:
+                # Need to solve POW challenge specifically for upload_file
+                challenge_res = self._make_request(
+                    'POST',
+                    '/chat/create_pow_challenge',
+                    {'target_path': '/api/v0/file/upload_file'}
+                )
+                challenge = challenge_res['data']['biz_data']['challenge']
+                pow_response = self.pow_solver.solve_challenge(challenge)
+                headers = self._get_headers(pow_response)
+                
+                # Remove content-type so curl_cffi can generate the correct multipart boundary
+                if 'content-type' in headers:
+                    del headers['content-type']
+
+                with open(file_path, "rb") as f:
+                    data = f.read()
+
+                mime_type, _ = mimetypes.guess_type(file_path)
+                if not mime_type:
+                    mime_type = 'application/octet-stream'
+
+                mp = CurlMime()
+                mp.addpart(
+                    name="file",
+                    content_type=mime_type,
+                    filename=Path(file_path).name,
+                    data=data,
+                )
+
+                response = requests.request(
+                    method='POST',
+                    url=url,
+                    headers=headers,
+                    multipart=mp,
+                    cookies=self.cookies,
+                    impersonate=self.impersonate,
+                    timeout=None
+                )
+
+                if "<!DOCTYPE html>" in response.text and "Just a moment" in response.text:
+                    print("\033[93mWarning: Cloudflare protection detected during upload. Bypassing...\033[0m", file=sys.stderr)
+                    if retry_count < max_retries - 1:
+                        self._refresh_cookies()
+                        retry_count += 1
+                        continue
+
+                if response.status_code == 401:
+                    raise AuthenticationError("Invalid or expired authentication token")
+                elif response.status_code == 429:
+                    raise RateLimitError("API rate limit exceeded")
+                elif response.status_code >= 500:
+                    raise APIError(f"Server error occurred: {response.text}", response.status_code)
+                elif response.status_code != 200:
+                    raise APIError(f"API request failed: {response.text}", response.status_code)
+
+                return response.json()
+
+            except requests.exceptions.RequestException as e:
+                raise NetworkError(f"Network error occurred: {str(e)}")
+            except json.JSONDecodeError:
+                raise APIError("Invalid JSON response from server")
+            except KeyError:
+                raise APIError("Invalid challenge response format from server")
+
+        raise APIError("Failed to bypass Cloudflare protection during upload")
+
     def _get_pow_challenge(self) -> Dict[str, Any]:
         try:
             response = self._make_request(
@@ -163,6 +237,36 @@ class DeepSeekAPI:
             return response['data']['biz_data']['challenge']
         except KeyError:
             raise APIError("Invalid challenge response format from server")
+
+    def upload_file(self, file_path: str) -> str:
+        """Uploads a file to DeepSeek and returns the file_id"""
+        try:
+            response = self._make_request_upload_file('/file/upload_file', file_path)
+            file_id = response['data']['biz_data']['id']
+            
+            # Poll status until SUCCESS
+            for _ in range(30): # Wait up to 30 seconds
+                time.sleep(1)
+                headers = self._get_headers()
+                r = requests.get(
+                    f"{self.BASE_URL}/file/fetch_files?file_ids={file_id}",
+                    headers=headers,
+                    cookies=self.cookies,
+                    impersonate=self.impersonate
+                )
+                if r.status_code == 200:
+                    try:
+                        res_data = r.json()
+                        files = res_data.get('data', {}).get('biz_data', {}).get('files', [])
+                        if files and files[0].get('status') == 'SUCCESS':
+                            return file_id
+                        elif files and files[0].get('status') == 'FAILED':
+                            raise APIError("Backend failed to process the uploaded file")
+                    except Exception:
+                        pass
+            return file_id
+        except KeyError:
+            raise APIError('Invalid upload file response format from server')
 
     def create_chat_session(self) -> str:
         """Creates a new chat session and returns the session ID"""
@@ -179,6 +283,7 @@ class DeepSeekAPI:
     def chat_completion(self,
                     chat_session_id: str,
                     prompt: str,
+                    ref_file_ids: Optional[List[str]] = None,
                     parent_message_id: Optional[str] = None,
                     thinking_enabled: bool = True,
                     search_enabled: bool = False) -> Generator[Dict[str, Any], None, None]:
@@ -188,6 +293,7 @@ class DeepSeekAPI:
         Args:
             chat_session_id (str): The ID of the chat session
             prompt (str): The message to send
+            ref_file_ids (Optional[List[str]]): List of file IDs to reference
             parent_message_id (Optional[str]): ID of the parent message for threading
             thinking_enabled (bool): Whether to show the thinking process
             search_enabled (bool): Whether to enable web search for up-to-date information
@@ -210,7 +316,7 @@ class DeepSeekAPI:
             'chat_session_id': chat_session_id,
             'parent_message_id': parent_message_id,
             'prompt': prompt,
-            'ref_file_ids': [],
+            'ref_file_ids': ref_file_ids or [],
             'thinking_enabled': thinking_enabled,
             'search_enabled': search_enabled,
         }
@@ -248,6 +354,17 @@ class DeepSeekAPI:
                     raise APIError(f"API request failed: {error_text}", response.status_code)
 
             for chunk in response.iter_lines():
+                if not chunk:
+                    continue
+                # Handle error JSON returned instead of SSE stream
+                if chunk.startswith(b'{"code":'):
+                    try:
+                        err_data = json.loads(chunk)
+                        biz_msg = err_data.get('data', {}).get('biz_msg', 'Unknown backend error')
+                        raise APIError(f"Backend rejected request: {biz_msg}")
+                    except json.JSONDecodeError:
+                        pass
+
                 try:
                     parsed = self._parse_chunk(chunk)
                     if parsed:
